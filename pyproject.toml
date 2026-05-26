@@ -1,0 +1,10 @@
+[project]
+name = "mindbridge"
+version = "0.1.0"
+description = "mindbridge project"
+readme = "README.md"
+requires-python = ">=3.10,<3.13"
+dependencies = []
+
+[tool.uv]
+package = false

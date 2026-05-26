@@ -13,6 +13,8 @@ set -euo pipefail
 cd "${SLURM_SUBMIT_DIR:-$(pwd)}"
 
 module load python/3.12.1
-source venv/bin/activate
+# Ensure uv is on PATH (adjust if you installed elsewhere)
+export PATH="${HOME}/.local/bin:${PATH}"
+source .venv/bin/activate
 
-# python your_script.py
+# Or: uv run python your_script.py

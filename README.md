@@ -18,15 +18,37 @@ cd mindbridge
 If `git clone` over SSH fails, add your Sherlock SSH public key to GitHub:
 **Settings → SSH and GPG keys → New SSH key**, then paste `~/.ssh/id_ed25519.pub` (or `id_rsa.pub`).
 
-## Environment setup (Sherlock)
+## Environment setup (uv)
+
+Uses [uv](https://docs.astral.sh/uv/) like your other projects. Creates `.venv/` locally (gitignored); `uv.lock` is committed for reproducible installs.
+
+### Laptop
 
 ```bash
-module load python/3.12.1
-python3 -m venv venv
-source venv/bin/activate
-pip install -U pip
-# pip install -r requirements.txt   # when you add dependencies
+cd mindbridge
+uv sync
+source .venv/bin/activate
+# uv add numpy   # add deps as you go
 ```
+
+### Sherlock
+
+One-time: install uv if it is not already on your PATH:
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+Then in the repo:
+
+```bash
+module load python/3.12.1   # or a version matching requires-python in pyproject.toml
+uv sync
+source .venv/bin/activate
+```
+
+Run without activating: `uv run python your_script.py`
 
 ## Sync changes
 
