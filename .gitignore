@@ -32,3 +32,26 @@ data/
 # Logs
 *.log
 slurm-*.out
+
+# Ignore the massive dataset folder
+nsd_data/
+download_output_*.txt
+download_data.sh
+.venv/
+
+# MindBridge Custom Pipeline Extensions
+scripts/mindbridge_full_*
+*.npy
+hf_cache/
+torch_cache/
+nsd_meta/
+
+# Catch all root and script directory slurm outputs
+*.out
+*.err
+scripts/*.out
+scripts/*.err
+logs/
+
+# Ignore duplicate/old script backups
+scripts/*_old.py
