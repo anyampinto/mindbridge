@@ -39,16 +39,16 @@ MOUNT  = "/mnt/mindbridge"   # where the volume is mounted inside the container
 image = (
     modal.Image.debian_slim(python_version="3.11")
     .apt_install("git", "libglib2.0-0", "libgl1")
-    # Install CUDA-enabled torch first (cu121 matches Modal's GPU drivers)
+    # torch 2.4+ required by diffusers>=0.30; cu124 matches Modal's current drivers
     .pip_install(
-        "torch==2.2.2",
-        "torchvision==0.17.2",
-        index_url="https://download.pytorch.org/whl/cu121",
+        "torch==2.4.1",
+        "torchvision==0.19.1",
+        index_url="https://download.pytorch.org/whl/cu124",
     )
     .pip_install(
         "open_clip_torch",
-        "diffusers>=0.27.0",
-        "transformers>=4.40.0",
+        "diffusers==0.30.3",
+        "transformers==4.44.2",
         "accelerate",
         "nibabel",
         "h5py",
@@ -68,7 +68,7 @@ app = modal.App("mindbridge", image=image)
 # INGESTION FUNCTION
 # =============================================================================
 @app.function(
-    gpu="A10G",                    # 24 GB VRAM — sufficient for CLIP+DINO+VAE sequentially
+    gpu=modal.gpu.A10G(),          # 24 GB VRAM — sufficient for CLIP+DINO+VAE sequentially
     volumes={MOUNT: volume},
     timeout=4 * 3600,
     cpu=8,
@@ -85,7 +85,7 @@ def ingest(subj: str = "subj01"):
 # TRAINING FUNCTION
 # =============================================================================
 @app.function(
-    gpu="A10G",
+    gpu=modal.gpu.A10G(),
     volumes={MOUNT: volume},
     timeout=12 * 3600,
     cpu=8,
@@ -101,7 +101,7 @@ def train(subj: str = "subj01"):
 # PIPELINE FUNCTION — ingest → train in a single container (no cold-start gap)
 # =============================================================================
 @app.function(
-    gpu="A10G",
+    gpu=modal.gpu.A10G(),
     volumes={MOUNT: volume},
     timeout=16 * 3600,
     cpu=8,
