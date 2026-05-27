@@ -32,11 +32,15 @@ def run_ingestion(subj: str = "subj01", root: Path = Path("/mnt/mindbridge")):
     print(f"Processing subject: {subj}")
 
     # ── Paths ─────────────────────────────────────────────────────────────────
-    data_dir = root / "nsd_data"
+    # Volume layout (flat — no per-subject subdirectories):
+    #   betas/betas_session01.hdf5 ... betas_session40.hdf5
+    #   rois/nsdgeneral.nii.gz
+    #   nsd_meta/nsd_expdesign.mat
+    #   nsd_meta/nsd_stimuli.hdf5
     meta_dir = root / "nsd_meta"
     meta_dir.mkdir(exist_ok=True, parents=True)
 
-    mask_path    = data_dir / "nsddata" / "ppdata" / subj / "func1pt8mm" / "roi" / "nsdgeneral.nii.gz"
+    mask_path    = root / "rois" / "nsdgeneral.nii.gz"
     expdesign    = meta_dir / "nsd_expdesign.mat"
     stim_path    = meta_dir / "nsd_stimuli.hdf5"
     betas_file   = meta_dir / f"betas_flat_{subj}.npy"
@@ -72,19 +76,26 @@ def run_ingestion(subj: str = "subj01", root: Path = Path("/mnt/mindbridge")):
         print(f"  Loaded betas: {betas_flat.shape}")
     else:
         print(f"\nLoading all 40 sessions for {subj}...")
+        print(f"  Searching under: {root / 'betas'}")
         all_betas = []
         for i in range(1, 41):
             sess      = f"session{str(i).zfill(2)}"
-            beta_path = (data_dir / "nsddata_betas" / "ppdata" / subj /
-                         "func1pt8mm" / "betas_fithrf" / f"betas_{sess}.hdf5")
+            beta_path = root / "betas" / f"betas_{sess}.hdf5"
             if not beta_path.exists():
-                print(f"  WARNING: {sess} not found, skipping")
+                print(f"  WARNING: {sess} not found at {beta_path}")
                 continue
             with h5py.File(beta_path, "r") as f:
                 raw = f["/betas"][:]
             betas_2d = (raw.astype(np.float32) / 300.0).reshape(750, -1)[:, mask_flat]
             all_betas.append(betas_2d)
             print(f"  Loaded {sess}: {betas_2d.shape}")
+
+        if not all_betas:
+            raise FileNotFoundError(
+                f"No beta sessions found for {subj}.\n"
+                f"Expected files at: {root / 'betas' / 'betas_session01.hdf5'}\n"
+                f"Check your volume upload with: modal volume ls mindbridge-data betas"
+            )
 
         betas_flat = np.concatenate(all_betas, axis=0)
         np.save(betas_file, betas_flat)
