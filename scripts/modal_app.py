@@ -68,7 +68,7 @@ app = modal.App("mindbridge", image=image)
 # INGESTION FUNCTION
 # =============================================================================
 @app.function(
-    gpu=modal.gpu.A10G(),          # 24 GB VRAM — sufficient for CLIP+DINO+VAE sequentially
+    gpu="A10G",                    # 24 GB VRAM — sufficient for CLIP+DINO+VAE sequentially
     volumes={MOUNT: volume},
     timeout=4 * 3600,
     cpu=8,
@@ -85,7 +85,7 @@ def ingest(subj: str = "subj01"):
 # TRAINING FUNCTION
 # =============================================================================
 @app.function(
-    gpu=modal.gpu.A10G(),
+    gpu="A10G",
     volumes={MOUNT: volume},
     timeout=12 * 3600,
     cpu=8,
@@ -101,7 +101,7 @@ def train(subj: str = "subj01"):
 # PIPELINE FUNCTION — ingest → train in a single container (no cold-start gap)
 # =============================================================================
 @app.function(
-    gpu=modal.gpu.A10G(),
+    gpu="A10G",
     volumes={MOUNT: volume},
     timeout=16 * 3600,
     cpu=8,
