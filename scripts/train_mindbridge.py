@@ -108,7 +108,11 @@ def mindbridge_loss(pred_clip, pred_dino, pred_vae, tgt_clip, tgt_dino, tgt_vae,
 # TRAINING ENTRY POINT
 # =============================================================================
 def run_training(subj: str = "subj01", root: Path = Path("/mnt/mindbridge")):
-    """Full Stage 1 training run for one subject."""
+    """
+    Full Stage 1 training run for one subject.
+    Resume-safe: saves a resume checkpoint every 10 epochs so a disconnect
+    never loses more than 10 epochs of progress.
+    """
 
     # ── Paths ─────────────────────────────────────────────────────────────────
     meta_dir  = root / "nsd_meta"
@@ -119,6 +123,8 @@ def run_training(subj: str = "subj01", root: Path = Path("/mnt/mindbridge")):
 
     betas_file   = meta_dir / f"betas_flat_{subj}.npy"
     targets_file = meta_dir / f"targets_full_{subj}.npz"
+    resume_ckpt  = ckpt_path / "resume_stage1.pt"   # overwritten every 10 epochs
+    best_ckpt    = ckpt_path / "best_stage1.pt"
 
     assert betas_file.exists(),   f"Betas not found: {betas_file}. Run ingestion first."
     assert targets_file.exists(), f"Targets not found: {targets_file}. Run ingestion first."
@@ -164,7 +170,7 @@ def run_training(subj: str = "subj01", root: Path = Path("/mnt/mindbridge")):
     print(f"\nTrain: {train_betas.shape}, Val: {val_betas.shape}")
 
     # ── DataLoaders ───────────────────────────────────────────────────────────
-    num_workers  = min(4, os.cpu_count() or 4)   # no SLURM env var needed
+    num_workers  = min(4, os.cpu_count() or 4)
     train_loader = DataLoader(NSDDataset(train_betas, train_clip, train_dino, train_vae),
                               batch_size=32, shuffle=True,
                               num_workers=num_workers, pin_memory=True, persistent_workers=True)
@@ -174,23 +180,39 @@ def run_training(subj: str = "subj01", root: Path = Path("/mnt/mindbridge")):
     print(f"Train batches: {len(train_loader)}, Val batches: {len(val_loader)}")
 
     # ── Model ─────────────────────────────────────────────────────────────────
+    EPOCHS = 150
+    LR     = 1e-4
+
     model = MindBridgeMLP(n_voxels=n_voxels, d_model=256, M=16,
                           d_clip=D_CLIP, d_dino=D_DINO, vae_shape=D_VAE,
                           dropout=0.5).to(device)
-    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"\nModel parameters: {n_params:,}")
-
-    # ── Training loop ─────────────────────────────────────────────────────────
-    EPOCHS    = 150
-    LR        = 1e-4
     optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-2)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
 
     best_val_loss = float("inf")
     history       = {"train": [], "val": []}
+    start_epoch   = 1
 
+    # ── Resume if a checkpoint exists ─────────────────────────────────────────
+    if resume_ckpt.exists():
+        print(f"\nResume checkpoint found — loading {resume_ckpt.name}...")
+        ckpt = torch.load(resume_ckpt, map_location=device)
+        model.load_state_dict(ckpt["model_state"])
+        optimizer.load_state_dict(ckpt["optimizer_state"])
+        scheduler.load_state_dict(ckpt["scheduler_state"])
+        best_val_loss = ckpt["best_val_loss"]
+        history       = ckpt["history"]
+        start_epoch   = ckpt["epoch"] + 1
+        print(f"  Resuming from epoch {start_epoch}/{EPOCHS} "
+              f"(best val loss so far: {best_val_loss:.4f})")
+    else:
+        n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"\nModel parameters: {n_params:,}")
+        print("No resume checkpoint found — starting from scratch.")
+
+    # ── Training loop ─────────────────────────────────────────────────────────
     print(f"\n=== Stage 1: Perception Pretraining ({subj}) ===")
-    for epoch in range(1, EPOCHS + 1):
+    for epoch in range(start_epoch, EPOCHS + 1):
         model.train()
         train_loss = 0.0
         for betas, clip_t, dino_t, vae_t in train_loader:
@@ -220,6 +242,7 @@ def run_training(subj: str = "subj01", root: Path = Path("/mnt/mindbridge")):
         history["train"].append(train_loss)
         history["val"].append(val_loss)
 
+        # Best checkpoint
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             torch.save({
@@ -227,9 +250,26 @@ def run_training(subj: str = "subj01", root: Path = Path("/mnt/mindbridge")):
                 "optimizer_state": optimizer.state_dict(),
                 "voxel_mean": voxel_mean, "voxel_std": voxel_std,
                 "n_voxels": n_voxels, "subj": subj,
-            }, ckpt_path / "best_stage1.pt")
+            }, best_ckpt)
 
+        # Resume checkpoint — saved every 10 epochs, always reflects latest state
         if epoch % 10 == 0:
+            torch.save({
+                "epoch": epoch,
+                "model_state": model.state_dict(),
+                "optimizer_state": optimizer.state_dict(),
+                "scheduler_state": scheduler.state_dict(),
+                "best_val_loss": best_val_loss,
+                "history": history,
+                "voxel_mean": voxel_mean,
+                "voxel_std": voxel_std,
+                "n_voxels": n_voxels,
+                "subj": subj,
+            }, resume_ckpt)
+            print(f"Epoch {epoch:3d}/{EPOCHS} | "
+                  f"train={train_loss:.4f} | val={val_loss:.4f} | best={best_val_loss:.4f} "
+                  f"[resume checkpoint saved]")
+        elif epoch % 10 == 0 or epoch == EPOCHS:
             print(f"Epoch {epoch:3d}/{EPOCHS} | "
                   f"train={train_loss:.4f} | val={val_loss:.4f} | best={best_val_loss:.4f}")
 

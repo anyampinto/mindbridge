@@ -129,9 +129,22 @@ def pipeline(subj: str = "subj01"):
 # =============================================================================
 # LOCAL ENTRYPOINT
 # =============================================================================
+ALL_SUBJECTS = ["subj01", "subj02", "subj03", "subj04",
+                "subj05", "subj06", "subj07", "subj08"]
+
 @app.local_entrypoint()
 def main(subj: str = "subj01", mode: str = "pipeline"):
-    if mode == "ingest":
+    if mode == "all":
+        # Spawn one container per subject — all run in parallel
+        for result in pipeline.map(ALL_SUBJECTS):
+            pass
+    elif mode == "ingest-all":
+        for result in ingest.map(ALL_SUBJECTS):
+            pass
+    elif mode == "train-all":
+        for result in train.map(ALL_SUBJECTS):
+            pass
+    elif mode == "ingest":
         ingest.remote(subj=subj)
     elif mode == "train":
         train.remote(subj=subj)
