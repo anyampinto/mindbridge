@@ -3,16 +3,17 @@
 MindBridge Stage 1 — Image Reconstruction Demo
 Runs on held-out val images and saves comparison grids.
 
-Modal usage (add to modal_app.py):
-    modal run modal_app.py --mode reconstruct --subj subj01
+Modal usage:
+    modal run modal_app.py --mode reconstruct --subj subj01   # single subject
+    modal run modal_app.py --mode reconstruct-all             # all 8 subjects, 2 images each
 
-Local usage (after downloading checkpoint + data):
-    python reconstruct.py --subj subj01 --root /mnt/mindbridge --n 12
+Local usage:
+    python reconstruct.py --subj subj01 --root /mnt/mindbridge --n 2
 
 Outputs (saved to root/reconstructions/subj/):
-    vae_grid.png        — ground truth vs VAE-decoded predictions
-    vd_grid.png         — ground truth vs Versatile Diffusion reconstructions (--vd flag)
-    gt_00.png ... gt_03.png, vae_00.png ... vae_03.png  — individual images for slides
+    vae_grid_subj01.png  — ground truth vs VAE-decoded predictions for that subject
+    vd_grid_subj01.png   — Versatile Diffusion reconstructions (--vd flag)
+    gt_00.png ... gt_01.png, vae_00.png ... vae_01.png  — individual images for slides
 """
 
 import os
@@ -140,7 +141,7 @@ def run_reconstruction(subj: str = "subj01",
     os.environ["HF_HOME"]            = str(root / "hf_cache")
     os.environ["TORCH_HOME"]         = str(root / "torch_cache")
 
-    out_dir = root / "reconstructions" / subj
+    out_dir = root / "reconstructions"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # ── Load checkpoint ───────────────────────────────────────────────────────
@@ -230,7 +231,7 @@ def run_reconstruction(subj: str = "subj01",
 
     save_comparison_grid(
         gt_imgs, vae_imgs, trial_labels,
-        out_dir / "vae_grid.png",
+        out_dir / f"vae_grid_{subj}.png",
         f"MindBridge VAE decode — {subj} (n={n})"
     )
 
@@ -264,15 +265,15 @@ def run_reconstruction(subj: str = "subj01",
 
         save_comparison_grid(
             gt_imgs, vd_imgs, trial_labels,
-            out_dir / "vd_grid.png",
+            out_dir / f"vd_grid_{subj}.png",
             f"MindBridge Versatile Diffusion — {subj} (n={n})"
         )
 
     # ── Save individual images for slides (first 4) ───────────────────────────
     print("\nSaving individual images...")
     for i in range(min(n, 4)):
-        gt_imgs[i].save(out_dir / f"gt_{i:02d}.png")
-        vae_imgs[i].save(out_dir / f"vae_{i:02d}.png")
+        gt_imgs[i].save(out_dir / f"gt_{subj}_{i:02d}.png")
+        vae_imgs[i].save(out_dir / f"vae_{subj}_{i:02d}.png")
 
     print(f"\nAll outputs saved to: {out_dir}")
     print("Done.")

@@ -166,5 +166,9 @@ def main(subj: str = "subj01", mode: str = "pipeline", n: int = 12, vd: bool = F
         train.remote(subj=subj)
     elif mode == "reconstruct":
         reconstruct.remote(subj=subj, n=n, vd=vd)
+    elif mode == "reconstruct-all":
+        # 2 images per subject, all 8 subjects in parallel
+        for _ in reconstruct.map(ALL_SUBJECTS, kwargs={"n": 2, "vd": vd}):
+            pass
     else:
         pipeline.remote(subj=subj)
