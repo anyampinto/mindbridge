@@ -59,7 +59,9 @@ image = (
         "huggingface_hub",
     )
     # Bundle your local scripts into the image so they can be imported
-    .add_local_python_source("cs231n_data_ingestion", "train_mindbridge", "reconstruct")
+    .add_local_file("cs231n_data_ingestion.py", "/root/cs231n_data_ingestion.py")
+    .add_local_file("train_mindbridge.py", "/root/train_mindbridge.py")
+    .add_local_file("reconstruct.py", "/root/reconstruct.py")
 )
 
 app = modal.App("mindbridge", image=image)
