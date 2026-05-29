@@ -147,7 +147,7 @@ def run_reconstruction(subj: str = "subj01",
     # ── Load checkpoint ───────────────────────────────────────────────────────
     ckpt_path = root / "checkpoints" / subj / "best_stage1.pt"
     assert ckpt_path.exists(), f"Checkpoint not found: {ckpt_path}"
-    ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     n_voxels   = ckpt["n_voxels"]
     voxel_mean = ckpt["voxel_mean"]   # (1, n_voxels) numpy array saved during training
     voxel_std  = ckpt["voxel_std"]
