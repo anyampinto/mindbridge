@@ -59,7 +59,7 @@ image = (
         "huggingface_hub",
     )
     # Bundle your local scripts into the image so they can be imported
-    .add_local_python_source("cs231n_data_ingestion", "train_mindbridge")
+    .add_local_python_source("cs231n_data_ingestion", "train_mindbridge", "reconstruct")
 )
 
 app = modal.App("mindbridge", image=image)
@@ -127,15 +127,31 @@ def pipeline(subj: str = "subj01"):
 
 
 # =============================================================================
+# RECONSTRUCTION FUNCTION
+# =============================================================================
+@app.function(
+    gpu="A10G",
+    volumes={MOUNT: volume},
+    timeout=2 * 3600,
+    cpu=4,
+    memory=32768,
+    secrets=[modal.Secret.from_name("huggingface-secret")],
+)
+def reconstruct(subj: str = "subj01", n: int = 12, vd: bool = False):
+    from reconstruct import run_reconstruction
+    run_reconstruction(subj=subj, root=Path(MOUNT), n=n, run_vd=vd)
+    volume.commit()
+
+
+# =============================================================================
 # LOCAL ENTRYPOINT
 # =============================================================================
 ALL_SUBJECTS = ["subj01", "subj02", "subj03", "subj04",
                 "subj05", "subj06", "subj07", "subj08"]
 
 @app.local_entrypoint()
-def main(subj: str = "subj01", mode: str = "pipeline"):
+def main(subj: str = "subj01", mode: str = "pipeline", n: int = 12, vd: bool = False):
     if mode == "all":
-        # Spawn one container per subject — all run in parallel
         for result in pipeline.map(ALL_SUBJECTS):
             pass
     elif mode == "ingest-all":
@@ -148,5 +164,7 @@ def main(subj: str = "subj01", mode: str = "pipeline"):
         ingest.remote(subj=subj)
     elif mode == "train":
         train.remote(subj=subj)
+    elif mode == "reconstruct":
+        reconstruct.remote(subj=subj, n=n, vd=vd)
     else:
         pipeline.remote(subj=subj)
