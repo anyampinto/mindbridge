@@ -1,0 +1,14 @@
+modal==1.4.3
+torch
+torchvision
+numpy
+h5py
+nibabel
+scipy
+matplotlib
+pillow
+open-clip-torch
+diffusers
+transformers
+accelerate
+safetensors
