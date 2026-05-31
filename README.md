@@ -50,6 +50,22 @@ source .venv/bin/activate
 
 Run without activating: `uv run python your_script.py`
 
+## Modal pipeline
+
+Deploy and run on [Modal](https://modal.com) (volume `mindbridge-data` at `/mnt/mindbridge`):
+
+```bash
+uv sync   # or: pip install -r requirements.txt
+modal run modal_app.py --subj subj01 --step download
+modal run modal_app.py --subj subj01 --step ingest              # betas only → reconstruct
+modal run modal_app.py --subj subj01 --step ingest --compute-targets  # full → train
+modal run modal_app.py --subj subj01 --step reconstruct
+```
+
+Ingest scripts: `scripts/ingest_betas.py` (fast, reconstruct) and `scripts/cs231n_data_ingestion.py` (full CLIP/DINO/VAE, training).
+
+See `modal_app.py` for all steps (`download`, `ingest`, `train`, `reconstruct`, `check`).
+
 ## Sync changes
 
 **From your laptop → GitHub → Sherlock:**
@@ -64,4 +80,4 @@ cd mindbridge && git pull
 
 ## Slurm job template
 
-Copy and edit `scripts/job.slurm` when you add training or batch jobs.
+Copy and edit `scripts/run_full_pipeline.sbatch` for Sherlock batch jobs.

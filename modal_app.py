@@ -125,10 +125,10 @@ def download_all(
 
 @app.function(image=image, gpu=gpu_fn, timeout=60 * 60 * 12, volumes={MINDBRIDGE_ROOT: volume})
 def ingest(subj: str = "subj01", compute_targets: bool = False):
-    """Flatten betas for one subject. Targets are optional (training only)."""
+    """Flatten betas (default) or run full target ingestion for training."""
     _configure_env(subj)
-    os.environ["NSD_COMPUTE_TARGETS"] = "1" if compute_targets else "0"
-    _run_script("cs231n_data_ingestion.py")
+    script = "cs231n_data_ingestion.py" if compute_targets else "ingest_betas.py"
+    _run_script(script)
     volume.commit()
     return f"Ingestion complete for {subj}"
 
@@ -165,7 +165,6 @@ def run_pipeline(subj: str = "subj01"):
     _configure_env(subj)
     targets = Path(MINDBRIDGE_ROOT) / "nsd_meta" / f"targets_full_{subj}.npz"
     if not targets.exists():
-        os.environ["NSD_COMPUTE_TARGETS"] = "1"
         _run_script("cs231n_data_ingestion.py")
         volume.commit()
 
@@ -205,8 +204,8 @@ def main(
     Examples:
       modal run modal_app.py --step download --all-subjects
       modal run modal_app.py --subj subj01 --step download
-      modal run modal_app.py --subj subj01 --step ingest
-      modal run modal_app.py --subj subj01 --step ingest --compute-targets
+      modal run modal_app.py --subj subj01 --step ingest              # betas only
+      modal run modal_app.py --subj subj01 --step ingest --compute-targets  # full
       modal run modal_app.py --subj subj01 --step reconstruct
     """
     if step == "download":
