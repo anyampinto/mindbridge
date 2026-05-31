@@ -1,4 +1,56 @@
-.venv/
+# Python
 __pycache__/
 *.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+venv/
+# uv creates .venv/ — keep it local, commit uv.lock instead
+.venv/
 .env
+
+# Jupyter
+.ipynb_checkpoints/
+
+# ML / data
+*.pt
+*.pth
+*.ckpt
+checkpoints/
+runs/
+wandb/
+data/
+*.h5
+*.npz
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+
+# Logs
+*.log
+slurm-*.out
+
+# Ignore the massive dataset folder
+nsd_data/
+download_output_*.txt
+download_data.sh
+
+# MindBridge Custom Pipeline Extensions
+scripts/mindbridge_full_*
+*.npy
+hf_cache/
+torch_cache/
+nsd_meta/
+
+# Catch all root and script directory slurm outputs
+*.out
+*.err
+scripts/*.out
+scripts/*.err
+logs/
+
+# Ignore duplicate/old script backups
+scripts/*_old.py
