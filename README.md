@@ -66,6 +66,26 @@ Ingest scripts: `scripts/ingest_betas.py` (fast, reconstruct) and `scripts/cs231
 
 See `modal_app.py` for all steps (`download`, `ingest`, `train`, `reconstruct`, `check`).
 
+### Production imagery reconstruction (~65% Kneeland A+B, subj01)
+
+Vendor dependency (one-time after clone):
+
+```bash
+git clone https://github.com/ozcelikfu/brain-diffuser.git vendor/brain-diffuser
+```
+
+Run calibrated Kneeland grids (uses existing volume checkpoints):
+
+```bash
+modal run modal_app.py --step kneeland-calibrated-recon --subj subj01
+# same recipe:
+modal run modal_app.py --step production-kneeland-subj01 --subj subj01
+```
+
+Outputs: `reconstructions/subj01/kn_atxt_a_txt005_b_vd03_s29/` (Set A + Set B).
+
+Stack: `4H_CTR2` dual (`best_retrieval`) → imagery beta adapter → diffusion prior (τ=1.5) → VD (Set B strength 0.3), Stage 1 `vdvae_ridge`.
+
 ## Sync changes
 
 **From your laptop → GitHub → Sherlock:**

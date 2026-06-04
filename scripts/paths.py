@@ -66,6 +66,22 @@ def run_root(root: Path | str | None = None, run_id: str | None = None) -> Path:
     return path
 
 
+def joint_ridge_ckpt_dir(root: Path | str, subj: str, run_id: str | None = None) -> Path:
+    """Per-subject joint ridge weights (W_joint.npy, voxel stats, …)."""
+    root = get_root(root)
+    rid = run_id or os.environ.get("MINDBRIDGE_RUN_ID") or "20260601_053733_joint_ridge_all8"
+    return run_root(root, rid) / "checkpoints_vJointRidge" / subj
+
+
+def resolve_joint_ridge_run_id(run_id: str | None = None) -> str:
+    if run_id:
+        return run_id
+    env = os.environ.get("MINDBRIDGE_RUN_ID")
+    if env:
+        return env
+    return "20260601_053733_joint_ridge_all8"
+
+
 def variant_ckpt_subdir(variant: str) -> str:
     """Filesystem folder under runs/{run_id}/ for a variant (may differ from variant.upper())."""
     overrides = {
@@ -73,6 +89,9 @@ def variant_ckpt_subdir(variant: str) -> str:
         "4H_roi": "checkpoints_v4head_roi",
         "4head_contrastive": "checkpoints_v4head_contrastive",
         "4H_ctr": "checkpoints_v4head_contrastive",
+        "4H_CTR": "checkpoints_v4H_CTR",
+        "4H_CTR2": "checkpoints_v4H_CTR2",
+        "dual_ctr": "checkpoints_v4H_CTR2",
         "4head_retrieval": "checkpoints_v4head_retrieval",
     }
     key = variant.strip()
@@ -131,9 +150,11 @@ def resolve_variant_checkpoint(
     """Resolve checkpoint: final.pt > best_clip.pt > legacy best.pt."""
     root = get_root(root)
     order = {
-        "final": ("final.pt", "best_clip.pt", "best.pt"),
-        "best_clip": ("best_clip.pt", "final.pt", "best.pt"),
-    }.get(prefer, (prefer, "final.pt", "best_clip.pt", "best.pt"))
+        "final": ("final.pt", "best_clip.pt", "best_retrieval.pt", "best_gen_proj.pt", "best.pt"),
+        "best_clip": ("best_clip.pt", "final.pt", "best_retrieval.pt", "best_gen_proj.pt", "best.pt"),
+        "best_retrieval": ("best_retrieval.pt", "best_gen_proj.pt", "best_clip.pt", "final.pt", "best.pt"),
+        "best_gen_proj": ("best_gen_proj.pt", "best_retrieval.pt", "best_clip.pt", "final.pt", "best.pt"),
+    }.get(prefer, (prefer, "final.pt", "best_clip.pt", "best_retrieval.pt", "best_gen_proj.pt", "best.pt"))
 
     if run_id or os.environ.get("MINDBRIDGE_RUN_ID"):
         for fname in order:
@@ -147,9 +168,56 @@ def resolve_variant_checkpoint(
         return legacy
 
     rid = run_id or os.environ.get("MINDBRIDGE_RUN_ID", "?")
-    tried = [str(root / RUNS_DIR / rid / f"checkpoints_v{variant.upper()}" / subj / f) for f in order]
+    tried = [str(root / RUNS_DIR / rid / variant_ckpt_subdir(variant) / subj / f) for f in order]
     raise FileNotFoundError(
         f"No checkpoint for {subj} variant {variant}. Tried:\n  " + "\n  ".join(tried)
+    )
+
+
+def resolve_variant_checkpoint_discover(
+    root: Path | str,
+    variant: str,
+    subj: str,
+    run_id: str | None = None,
+    prefer: str = "best_retrieval",
+) -> tuple[Path, str]:
+    """
+    Like resolve_variant_checkpoint, but if run_id misses, scan runs/*/checkpoints_* /subj/.
+    Returns (path, resolved_run_id).
+    """
+    import re
+
+    root = get_root(root)
+    candidates: list[str] = []
+    if run_id:
+        candidates.append(run_id)
+        if re.search(r"subj\d+", run_id):
+            rewritten = re.sub(r"subj\d+", subj, run_id, count=1)
+            if rewritten not in candidates:
+                candidates.append(rewritten)
+
+    for rid in candidates:
+        try:
+            return resolve_variant_checkpoint(root, variant, subj, rid, prefer), rid
+        except FileNotFoundError:
+            continue
+
+    order = {
+        "final": ("final.pt", "best_clip.pt", "best_retrieval.pt", "best_gen_proj.pt", "best.pt"),
+        "best_clip": ("best_clip.pt", "final.pt", "best_retrieval.pt", "best_gen_proj.pt", "best.pt"),
+        "best_retrieval": ("best_retrieval.pt", "best_gen_proj.pt", "best_clip.pt", "final.pt", "best.pt"),
+        "best_gen_proj": ("best_gen_proj.pt", "best_retrieval.pt", "best_clip.pt", "final.pt", "best.pt"),
+    }.get(prefer, (prefer, "final.pt", "best_clip.pt", "best_retrieval.pt", "best_gen_proj.pt", "best.pt"))
+    subdir = variant_ckpt_subdir(variant)
+    for run_dir in list_runs(root, variant=None):
+        for fname in order:
+            path = run_dir / subdir / subj / fname
+            if path.exists():
+                print(f"  Discovered {variant} ckpt for {subj}: {path} (run={run_dir.name})")
+                return path, run_dir.name
+
+    raise FileNotFoundError(
+        f"No checkpoint for {subj} variant {variant} (scanned runs/*/{subdir}/)."
     )
 
 

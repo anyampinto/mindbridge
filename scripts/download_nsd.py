@@ -26,6 +26,7 @@ S3_BUCKET = "s3://natural-scenes-dataset"
 AWS_REGION = "us-east-2"
 BETA_VERSION = "betas_fithrf_GLMdenoise_RR"
 IMAGERY_BETA_VERSION = "nsdimagerybetas_fithrf_GLMdenoise_RR"
+IMAGERY_SYNC_EXCLUDES = ["*.mp4"]  # skip screencapture videos (large, unused)
 ALL_SUBJECTS = [f"subj{i:02d}" for i in range(1, 9)]
 
 # Public S3 release: four subjects completed 40 sessions; others had fewer scans.
@@ -117,10 +118,15 @@ def aws_s3_sync(
     ]
     if not force:
         cmd.extend(["--size-only"])
-    for pattern in excludes or ["*"]:
-        cmd.extend(["--exclude", pattern])
-    for pattern in includes or []:
-        cmd.extend(["--include", pattern])
+    # Selective sync: exclude all then include patterns. Full sync: no filters.
+    if includes is not None:
+        for pattern in excludes or ["*"]:
+            cmd.extend(["--exclude", pattern])
+        for pattern in includes:
+            cmd.extend(["--include", pattern])
+    elif excludes:
+        for pattern in excludes:
+            cmd.extend(["--exclude", pattern])
     if os.environ.get("NSD_AWS_DRYRUN", "0") == "1":
         cmd.append("--dryrun")
 
@@ -176,13 +182,28 @@ def download_shared_metadata(root: Path, *, stimuli: bool = True, force: bool = 
 
 
 def download_imagery_metadata(root: Path, *, force: bool = False) -> None:
+    """Sync NSD-Imagery experiment files (design matrices, pair lists, stimuli, etc.).
+
+    Skips *.mp4 screencapture videos — they are large and not used by the pipeline.
+    Includes designmatrixGLMsingle.mat, *\_dm.mat, pair lists, and stimulus PNGs.
+    """
     root = get_root(root)
     print("\n=== NSD-Imagery experiment metadata (AWS CLI) ===")
     aws_s3_sync(
         f"{S3_BUCKET}/nsddata/experiments/nsdimagery",
         root / "nsd_meta" / "nsdimagery",
-        excludes=["*"],
-        includes=["*.mat"],
+        excludes=IMAGERY_SYNC_EXCLUDES,
+        force=force,
+    )
+
+
+def download_roi_masks(subj: str, root: Path, *, force: bool = False) -> None:
+    """Sync all ROI masks for one subject (~2-5MB each)."""
+    root = get_root(root)
+    print(f"\n=== NSD ROI masks ({subj}) ===")
+    aws_s3_sync(
+        f"{S3_BUCKET}/nsddata/ppdata/{subj}/func1pt8mm/roi",
+        local_path(root, f"nsddata/ppdata/{subj}/func1pt8mm/roi"),
         force=force,
     )
 
@@ -200,11 +221,7 @@ def download_perception_sessions(
 
     print(f"\n=== NSD perception betas ({subj}, {len(list(sessions))} sessions) ===")
 
-    aws_s3_cp(
-        f"{S3_BUCKET}/nsddata/ppdata/{subj}/func1pt8mm/roi/nsdgeneral.nii.gz",
-        local_path(root, f"nsddata/ppdata/{subj}/func1pt8mm/roi/nsdgeneral.nii.gz"),
-        force=force,
-    )
+    download_roi_masks(subj, root, force=force)
 
     includes = [f"betas_session{session:02d}.hdf5" for session in sessions]
     aws_s3_sync(
