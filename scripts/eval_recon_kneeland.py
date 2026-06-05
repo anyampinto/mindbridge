@@ -42,7 +42,7 @@ def encode_images_clip(
     import torch.nn.functional as F
     from transformers import CLIPModel, CLIPProcessor
 
-    from eval_imagery_crossdecode import _as_clip_tensor
+    from eval_imagery_crossdecode import _as_clip_tensor, _clip_image_features
 
     repo = "openai/clip-vit-large-patch14"
     model = CLIPModel.from_pretrained(repo).to(device).eval()
@@ -52,7 +52,7 @@ def encode_images_clip(
         for i in range(0, len(images), batch_size):
             batch = images[i : i + batch_size]
             pixel = processor(images=batch, return_tensors="pt")["pixel_values"].to(device)
-            feat = F.normalize(_as_clip_tensor(model.get_image_features(pixel_values=pixel)), dim=-1)
+            feat = F.normalize(_as_clip_tensor(_clip_image_features(model, pixel)), dim=-1)
             embs.append(feat.cpu().numpy())
     return np.concatenate(embs, axis=0).astype(np.float32)
 

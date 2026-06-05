@@ -54,3 +54,4 @@ logs/
 
 # Ignore duplicate/old script backups
 scripts/*_old.py
+vendor/

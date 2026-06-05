@@ -91,6 +91,7 @@ def variant_ckpt_subdir(variant: str) -> str:
         "4H_ctr": "checkpoints_v4head_contrastive",
         "4H_CTR": "checkpoints_v4H_CTR",
         "4H_CTR2": "checkpoints_v4H_CTR2",
+        "4H_CTR2_1H": "checkpoints_v4H_CTR2_1H",
         "dual_ctr": "checkpoints_v4H_CTR2",
         "4head_retrieval": "checkpoints_v4head_retrieval",
     }

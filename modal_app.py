@@ -611,6 +611,9 @@ def reconstruct_vdvae_dual(
     adapter_train_subj: str = "",
     use_pooled_prior: bool = False,
     perception_setb_only: bool = False,
+    brain_ablation: str = "",
+    prior_free: bool = False,
+    ablation_seed: int = -1,
 ):
     """VDVAE Stage 1 + dual projector VD Stage 2 (Set B + perception val grids)."""
     volume.reload()
@@ -677,6 +680,12 @@ def reconstruct_vdvae_dual(
         sys.argv.extend(["--kneeland-a-text-source", kneeland_a_text_source])
     if kneeland_b_text_source:
         sys.argv.extend(["--kneeland-b-text-source", kneeland_b_text_source])
+    if brain_ablation:
+        sys.argv.extend(["--brain-ablation", brain_ablation])
+    if prior_free:
+        sys.argv.append("--prior-free")
+    if ablation_seed >= 0:
+        sys.argv.extend(["--ablation-seed", str(ablation_seed)])
     import io
     from contextlib import redirect_stdout
 
@@ -737,6 +746,38 @@ def reeval_recon_grid(
     reeval_main()
     volume.commit()
     return f"Re-eval complete: {stage2_dir_rel or grid_rel}"
+
+
+@app.function(image=image, gpu=gpu_fn, timeout=60 * 60 * 12, volumes={MINDBRIDGE_ROOT: volume})
+def run_ablations_subj(
+    subj: str = "subj01",
+    ablation: str = "all-inference",
+    dual_run_id: str = "",
+    beta_adapter_run_id: str = "",
+    base_out: str = "kn_atxt_a_txt005_b_vd03_s29",
+    seed: int = 29,
+):
+    """Run MindBridge gatekeeper ablations (prior-only, ROI shuffle, prior-free)."""
+    volume.reload()
+    _configure_env(subj)
+    import sys
+    from run_ablations import main as ablation_main
+
+    sys.argv = [
+        "run_ablations.py",
+        "--subj", subj,
+        "--root", MINDBRIDGE_ROOT,
+        "--ablation", ablation,
+        "--seed", str(seed),
+        "--base-out", base_out,
+    ]
+    if dual_run_id:
+        sys.argv.extend(["--dual-run-id", dual_run_id])
+    if beta_adapter_run_id:
+        sys.argv.extend(["--beta-adapter-run-id", beta_adapter_run_id])
+    ablation_main()
+    volume.commit()
+    return f"Ablation {ablation} complete for {subj}"
 
 
 @app.function(image=image, gpu=gpu_fn, timeout=60 * 30, volumes={MINDBRIDGE_ROOT: volume})
@@ -1078,6 +1119,27 @@ def roi_corr_audit_subj(train_subj: str = "subj01"):
     roi_corr_main()
     volume.commit()
     return f"roi_corr_audit done for train={train_subj}"
+
+
+@app.function(
+    image=image,
+    timeout=60 * 5,
+    volumes={MINDBRIDGE_ROOT: volume},
+)
+def inspect_vdvae_ridge(subj: str = "subj01"):
+    import numpy as np
+
+    path = f"{MINDBRIDGE_ROOT}/nsd_meta/vdvae_ridge_trials_{subj}.npz"
+    p = np.load(path)
+    print(f"=== {path} ===")
+    print("mode:", p.get("mode"))
+    for k in sorted(p.files):
+        v = p[k]
+        if hasattr(v, "shape"):
+            print(f"  {k}: shape={v.shape} dtype={v.dtype}")
+        else:
+            print(f"  {k}: {v}")
+    return "done"
 
 
 @app.function(
@@ -3001,5 +3063,40 @@ def main(
         print(download_roi_all.remote())
     elif step == "download-imagery-meta":
         print(download_imagery_meta.remote())
+    elif step == "ablation-suite":
+        dual_rid = os.environ.get("DUAL_RUN_ID", "20260602_053625_train_dual_contrastive_subj01_150ep")
+        beta_rid = beta_adapter_run_id or "20260603_230807_imagery_beta_adapter_subj01"
+        base_out = os.environ.get("KNEELAND_OUT", "kn_atxt_a_txt005_b_vd03_s29")
+        seed = int(os.environ.get("PRIOR_SEED", "29"))
+        ablation = os.environ.get("ABLATION", "all-inference")
+        roi_path = Path(MINDBRIDGE_ROOT) / "nsddata" / "ppdata" / subj / "func1pt8mm" / "roi" / "prf-eccrois.nii.gz"
+        if not roi_path.exists() and ablation in ("all-inference", "roi_shuffle"):
+            print(f"=== Syncing ROI masks for {subj} (ROI shuffle ablation) ===")
+            print(download_roi_all.remote())
+        print(f"=== MindBridge ablation suite ({ablation}) subj={subj} ===")
+        print(run_ablations_subj.remote(subj, ablation, dual_rid, beta_rid, base_out, seed))
+    elif step == "ablation-1head-train":
+        epochs = int(os.environ.get("ONEHEAD_EPOCHS", str(epochs or 80)))
+        rid = run_id or ""
+        print(f"=== 1-head contrastive collapse train subj={subj} epochs={epochs} ===")
+        extra = []
+        if rid:
+            os.environ["MINDBRIDGE_RUN_ID"] = rid
+        print(train.remote(subj, "train_dual_contrastive_1head.py", epochs, rid, extra))
+    elif step == "ablation-1head-recon":
+        dual_rid = os.environ.get(
+            "ONEHEAD_RUN_ID",
+            run_id or "20260605_train_dual_contrastive_1head_subj01",
+        )
+        beta_rid = beta_adapter_run_id or "20260603_230807_imagery_beta_adapter_subj01"
+        seed = int(os.environ.get("PRIOR_SEED", "29"))
+        osd = os.environ.get("KNEELAND_OUT", "kn_atxt_a_txt005_b_vd03_s29_abl_1head")
+        print(f"=== 1-head ablation recon subj={subj} run={dual_rid} → {osd} ===")
+        print(reconstruct_vdvae_dual.remote(
+            subj, dual_rid, "4H_CTR2_1H", "best_retrieval", 3, 0.3, 50, 7.5,
+            False, False, beta_rid, "prior", "", 1.5, True, osd,
+            "", 0.6, 0.05, 0.85, seed, seed, "kneeland", 0.85, 0.3,
+            "mlp_text_hf_dual", "", "vdvae_ridge",
+        ))
     else:
         print(run_pipeline.remote(subj))

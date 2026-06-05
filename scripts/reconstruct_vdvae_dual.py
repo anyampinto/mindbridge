@@ -42,6 +42,7 @@ from pathlib import Path
 from PIL import Image
 
 from paths import get_root, resolve_joint_ridge_run_id, resolve_variant_checkpoint
+from ablation_utils import apply_brain_ablation
 from reconstruct_common import (
     build_recon_model,
     forward_recon,
@@ -99,7 +100,7 @@ TEXT_SOURCES = ("", "mlp_text_hf_dual", "mlp_text_only", "caption_retrieval")
 DEFAULT_TEXT_TO_IMAGE_STRENGTH = {"caption_retrieval": 0.4, "mlp_text_hf_dual": 0.15, "mlp_text_only": 1.0}
 IMAGERY_SET_CHOICES = ("set_b", "set_a", "kneeland")
 # Imagery CLIP for VD must come from dual-contrastive MLP (not joint ridge / COCO captions).
-DUAL_MLP_VARIANTS = frozenset({"4H_CTR", "4H_CTR2"})
+DUAL_MLP_VARIANTS = frozenset({"4H_CTR", "4H_CTR2", "4H_CTR2_1H"})
 
 
 def require_dual_mlp_imagery_path(
@@ -595,6 +596,33 @@ def _load_vd_pipe(
     return pipe
 
 
+def _maybe_ablate_betas(
+    betas: np.ndarray,
+    brain_ablation: str | None,
+    *,
+    root: Path,
+    subj: str,
+    dual_vm: np.ndarray | None,
+    dual_vs: np.ndarray | None,
+    seed: int | None,
+) -> np.ndarray:
+    if not brain_ablation:
+        return betas
+    train_mean = dual_vm.reshape(-1) if dual_vm is not None else None
+    train_std = dual_vs.reshape(-1) if dual_vs is not None else None
+    out = apply_brain_ablation(
+        betas,
+        brain_ablation,
+        root=root,
+        subj=subj,
+        seed=seed or 42,
+        train_mean=train_mean,
+        train_std=train_std,
+    )
+    print(f"  Brain ablation applied: {brain_ablation}  shape={out.shape}")
+    return out
+
+
 def _reconstruct_imagery_set(
     *,
     set_id: str,
@@ -637,6 +665,8 @@ def _reconstruct_imagery_set(
     kneeland_full_set_b: bool = False,
     stage1_source: str = "vdvae_ridge",
     beta_adapter_train_subj: str = "subj01",
+    brain_ablation: str | None = None,
+    ablation_seed: int | None = None,
 ) -> None:
     adapter_train = beta_adapter_train_subj or os.environ.get("ADAPTER_TRAIN_SUBJ", subj)
     set_id = set_id.upper()
@@ -661,6 +691,16 @@ def _reconstruct_imagery_set(
         adapter_ckpt = torch.load(adapter_path, map_location="cpu", weights_only=False)
     else:
         betas_i = betas_raw
+
+    betas_i = _maybe_ablate_betas(
+        betas_i,
+        brain_ablation,
+        root=root,
+        subj=subj,
+        dual_vm=dual_vm,
+        dual_vs=dual_vs,
+        seed=ablation_seed if ablation_seed is not None else prior_seed,
+    )
 
     gt_i, labels_i = [], []
     for i in row_idx:
@@ -779,8 +819,18 @@ def run_reconstruction(
     beta_adapter_train_subj: str | None = None,
     prior_subj: str | None = None,
     perception_setb_only: bool = False,
+    brain_ablation: str | None = None,
+    prior_free: bool = False,
+    ablation_seed: int | None = None,
 ) -> dict:
     root = get_root(root)
+    if prior_free:
+        guidance_scale = 1.0
+        stage2_source = "regression"
+        text_source = ""
+        kneeland_a_text_source = ""
+        kneeland_b_text_source = ""
+        print("  Prior-free ablation: regression CLIP only, CFG=1.0, no text/prior")
     if imagery_sets not in IMAGERY_SET_CHOICES:
         raise ValueError(f"imagery_sets must be one of {IMAGERY_SET_CHOICES} (Set C removed)")
     if stage2_source not in STAGE2_SOURCES:
@@ -933,6 +983,8 @@ def run_reconstruction(
         "prior_seed": prior_seed,
         "vd_seed": vd_seed,
         "prior_blend_weight": float(prior_blend_weight) if stage2_source == "prior_blend" else None,
+        "brain_ablation": brain_ablation,
+        "prior_free": prior_free,
     }
     if prior_bundle:
         results["prior_ckpt"] = prior_bundle["path"]
@@ -971,6 +1023,11 @@ def run_reconstruction(
                 root, row.get("label", ""), cue=str(row.get("cue", "")), size=256,
             ))
         betas_p = np.stack(betas_list, axis=0)
+        betas_p = _maybe_ablate_betas(
+            betas_p, brain_ablation, root=root, subj=subj,
+            dual_vm=dual_vm, dual_vs=dual_vs,
+            seed=ablation_seed if ablation_seed is not None else prior_seed,
+        )
 
         print(
             f"\n  Perception Set-B Kneeland ({len(row_idx)} stimuli, same cues as imagery Set-B):"
@@ -1015,6 +1072,11 @@ def run_reconstruction(
             len(betas_all), n_perception, image_ids=img_ids_all,
         )
         betas_p = betas_all[trial_idx]
+        betas_p = _maybe_ablate_betas(
+            betas_p, brain_ablation, root=root, subj=subj,
+            dual_vm=dual_vm, dual_vs=dual_vs,
+            seed=ablation_seed if ablation_seed is not None else prior_seed,
+        )
         stim_ids = img_ids_all[trial_idx].astype(int)
         gt_p, labels_p = [], []
         with h5py.File(root / "nsd_meta" / "nsd_stimuli.hdf5", "r") as f:
@@ -1104,7 +1166,15 @@ def run_reconstruction(
         else:
             sets_to_run = ["A"]
         for sid in sets_to_run:
-            cfg = KNEELAND_HF_CONFIG[sid]
+            if prior_free:
+                vd_s_base = float(kneeland_b_vd_strength if kneeland_b_vd_strength is not None else vd_strength)
+                cfg = {
+                    "text_source": "",
+                    "stage2_source": "regression",
+                    "vd_strength": 0.12 if sid == "A" else vd_s_base,
+                }
+            else:
+                cfg = KNEELAND_HF_CONFIG[sid]
             ts = cfg["text_source"]
             if sid == "A" and kneeland_a_text_source:
                 ts = kneeland_a_text_source
@@ -1160,6 +1230,8 @@ def run_reconstruction(
                 kneeland_full_set_b=(imagery_sets == "kneeland"),
                 stage1_source=s1_imagery,
                 beta_adapter_train_subj=adapter_train,
+                brain_ablation=brain_ablation,
+                ablation_seed=ablation_seed if ablation_seed is not None else prior_seed,
             )
         if eval_recon_kneeland and imagery_sets == "kneeland":
             from eval_imagery_crossdecode import _eval_row_indices
@@ -1643,6 +1715,18 @@ def main() -> None:
         default="",
         help="Comma-separated prior/vd seeds for kneeland multisample sweep (with --imagery-sets kneeland)",
     )
+    ap.add_argument(
+        "--brain-ablation",
+        default=None,
+        choices=("zeros", "mean", "random", "roi_shuffle"),
+        help="Replace fMRI betas at inference (prior-only / ROI shuffle gatekeepers)",
+    )
+    ap.add_argument(
+        "--prior-free",
+        action="store_true",
+        help="Brain-only ablation: regression CLIP, no DDIM prior, CFG=1.0, no text",
+    )
+    ap.add_argument("--ablation-seed", type=int, default=None, help="RNG seed for brain ablations")
     args = ap.parse_args()
 
     if args.multisample_seeds and args.imagery_sets == "kneeland":
@@ -1712,6 +1796,9 @@ def main() -> None:
         stage1_source_perception=args.stage1_source_perception,
         stage1_source_imagery=args.stage1_source_imagery,
         perception_setb_only=args.perception_setb_only,
+        brain_ablation=args.brain_ablation,
+        prior_free=args.prior_free,
+        ablation_seed=args.ablation_seed,
     )
     if args.eval_recon_kneeland:
         k2a = results.get("recon_kneeland_2wc_set_a", {})

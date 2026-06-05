@@ -132,6 +132,25 @@ def predict_vdvae_latents(betas: np.ndarray, pack: dict) -> np.ndarray:
         pred_pca = x @ pack["W"].T + pack["b"]
         return pca_to_latents(pred_pca, pack)
 
+    if mode == "trials_early_pca":
+        pred_pca = x @ pack["W"].T + pack["b"]
+        comps = pack["early_pca_components"].astype(np.float32)
+        mean = pack["early_pca_mean"].astype(np.float32)
+        early_lat = pred_pca @ comps + mean
+        early_dim = int(pack.get("early_flat_dim", early_lat.shape[1]))
+        late_mean = pack.get("latent_mean_late")
+        if late_mean is None and "train_latent_mean" in pack:
+            late_mean = pack["train_latent_mean"][early_dim:]
+        layer_dims = pack.get("layer_flat_dims")
+        if late_mean is not None and layer_dims is not None:
+            full_dim = int(np.asarray(layer_dims, dtype=np.int64).sum())
+            out = np.zeros((len(betas), full_dim), dtype=np.float32)
+            ed = min(early_dim, early_lat.shape[1])
+            out[:, :ed] = early_lat[:, :ed]
+            out[:, early_dim:] = np.asarray(late_mean, dtype=np.float32)
+            return out
+        return early_lat
+
     if mode == "roi_pca":
         n_comp = int(pack["n_components"])
         pred_pca = np.zeros((len(betas), n_comp), dtype=np.float32)

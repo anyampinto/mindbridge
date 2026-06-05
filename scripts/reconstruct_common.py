@@ -77,7 +77,7 @@ class MindBridgeMLP(nn.Module):
         return pred_clip, pred_dino, pred_vae
 
 
-VARIANT_CHOICES = ("A", "4H", "4H_CTR", "4H_CTR2", "dual_ctr")
+VARIANT_CHOICES = ("A", "4H", "4H_CTR", "4H_CTR2", "4H_CTR2_1H", "dual_ctr")
 CLIP_SOURCE_CHOICES = ("regression", "projector")
 CKPT_PREFERS = ("final", "best_clip", "best_retrieval")
 
@@ -94,6 +94,7 @@ VARIANT_LABELS = {
     "4H": "Global 4-head",
     "4H_CTR": "4-head + contrastive retrieval",
     "4H_CTR2": "4-head + dual contrastive (image + text projectors)",
+    "4H_CTR2_1H": "4-head + single collapsed contrastive projector (ablation)",
     "dual_ctr": "4-head + dual contrastive (image + text projectors)",
 }
 
@@ -106,6 +107,8 @@ def normalize_variant(variant: str) -> str:
         return "4H_CTR"
     if v in ("4H_CTR2", "DUAL_CTR", "DUAL-CTR"):
         return "4H_CTR2"
+    if v in ("4H_CTR2_1H", "1HEAD", "1H"):
+        return "4H_CTR2_1H"
     return v
 
 
@@ -123,6 +126,9 @@ def build_recon_model(variant: str, n_voxels: int, device: torch.device) -> nn.M
     elif v == "4H_CTR2":
         from train_dual_contrastive import MindBridgeContrastive
         model = MindBridgeContrastive(n_voxels=n_voxels)
+    elif v == "4H_CTR2_1H":
+        from train_dual_contrastive_1head import MindBridgeContrastive1Head
+        model = MindBridgeContrastive1Head(n_voxels=n_voxels)
     else:
         raise ValueError(f"Unknown variant {variant!r}; choose from {VARIANT_CHOICES}")
     return model.to(device)
@@ -176,7 +182,7 @@ def forward_recon(
         pred_clip, _, pred_vae = model(betas)
     elif v == "4H":
         pred_clip, _, _, pred_vae = model(betas)
-    elif v in ("4H_CTR", "4H_CTR2"):
+    elif v in ("4H_CTR", "4H_CTR2", "4H_CTR2_1H"):
         out = model(betas)
         pred_clip, _, _, pred_vae, proj = out[0], out[1], out[2], out[3], out[4]
         if clip_source == "projector":
@@ -184,7 +190,7 @@ def forward_recon(
     else:
         raise ValueError(variant)
 
-    if clip_source == "projector" and v not in ("4H_CTR", "4H_CTR2"):
+    if clip_source == "projector" and v not in ("4H_CTR", "4H_CTR2", "4H_CTR2_1H"):
         raise ValueError("--clip-source projector requires variant 4H_CTR or 4H_CTR2")
 
     return pred_clip, pred_vae
