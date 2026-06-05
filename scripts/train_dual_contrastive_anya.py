@@ -1,20 +1,23 @@
 # -*- coding: utf-8 -*-
 """
-MindBridge with decoupled contrastive retrieval head.
+MindBridge with dual decoupled contrastive retrieval heads (image + text).
 
-Key changes vs train4heads.py:
-  - 4th head is a *separate* L2-normalized MLP projector trained with
-    BiMixCo → SoftCLIP contrastive loss (MindEye schedule).
-  - Contrastive target: 257-token CLIP ViT-L/14 hidden layer (not 768-d CLS).
-    Falls back to 768-d CLS if hidden-layer cache not available.
-  - Gradient accumulation to simulate large effective batch (≥256 negatives).
-  - Retrieval metric measured on projector head; CosSim measured on regression head.
-  - Early stopping on val retrieval (primary) or val CLIP cosim (fallback).
-  - Regression heads (CLIP image, CLIP text, DINO, VAE) unchanged from 4-head baseline.
+Key changes vs train_contrastive_retrieval.py (image-only):
+  - Image projector: brain → 1024-d L2-norm, trained with BiMixCo → SoftCLIP
+    against pooled 257-token ViT-L/14 hidden states. Falls back to 768-d CLS.
+  - Text projector:  brain → 768-d L2-norm, trained with SoftCLIP against
+    COCO caption CLIP text embeddings (already in targets_avg_{subj}.npz).
+    Masked where captions are missing (zero rows). Targets semantic/conceptual
+    content — expected to improve Set C (concept) imagery retrieval.
+  - Both projectors are SEPARATE from each other and from the 4 regression heads.
+  - Gradient accumulation for large effective batch (>=256 negatives).
+  - Retrieval reported separately for image projector and text projector.
+  - Early stopping on image projector retrieval (primary metric).
 
 Loss schedule (MindEye):
   Epochs [0, mixup_pct * total):   BiMixCo  — bidirectional CLIP loss + Beta mixup
-  Epochs [mixup_pct * total, end): SoftCLIP — soft labels from CLIP-image ⊗ CLIP-image
+  Epochs [mixup_pct * total, end): SoftCLIP — soft labels from CLIP-image x CLIP-image
+  Text projector always uses SoftCLIP (text embeddings have no mixup defined).
 """
 
 import os
@@ -45,7 +48,7 @@ from training_checkpoints import (
 )
 
 # ── variant tag ──────────────────────────────────────────────────────────────
-VARIANT = "4H_CTR"  # 4-head + contrastive retrieval head
+VARIANT = "4H_CTR2"  # 4-head + image contrastive + text contrastive
 
 # ── regression loss weights (unchanged from 4H baseline) ─────────────────────
 W_CLIP_IMAGE = 1.0
@@ -53,8 +56,9 @@ W_CLIP_TEXT  = 0.3
 W_DINO       = 0.1
 W_VAE        = 0.001
 
-# ── contrastive loss weight relative to total regression loss ─────────────────
-W_CONTRASTIVE = 1.0   # tune: try 0.5, 1.0, 2.0
+# ── contrastive loss weights ──────────────────────────────────────────────────
+W_CONTRASTIVE      = 1.0   # image contrastive (primary retrieval signal)
+W_TEXT_CONTRASTIVE = 0.5   # text contrastive (semantic/concept signal); tune 0.25–1.0
 
 # ── BiMixCo → SoftCLIP schedule ──────────────────────────────────────────────
 MIXUP_PCT      = 0.33          # fraction of epochs using BiMixCo
@@ -70,10 +74,13 @@ PATIENCE       = 30            # epochs without improvement before stopping
 MIN_DELTA      = 1e-3          # minimum improvement to reset patience
 
 # ── projector head dims ───────────────────────────────────────────────────────
-D_PROJ         = 768           # projector output dim (matches CLIP CLS for cosine retrieval)
+D_PROJ         = 1024          # must match hidden target dim (ViT-L/14 internal = 1024)
 
 # ── 257-token hidden layer dim for ViT-L/14 ──────────────────────────────────
-D_HIDDEN_TOKEN = 768           # each of 257 tokens is 768-d in ViT-L/14
+# ViT-L/14 last_hidden_state is (B, 257, 1024) — 1024 is the internal d_model.
+# The 768-d CLS you've been using is AFTER visual_projection (a 1024→768 linear).
+# We use the pre-projection hidden states for richer spatial token information.
+D_HIDDEN_TOKEN = 1024          # ViT-L/14 internal dim (NOT 768)
 N_TOKENS       = 257
 
 
@@ -84,7 +91,7 @@ N_TOKENS       = 257
 class AveragedNSDDataset(Dataset):
     """
     Returns (betas, clip_image_cls, clip_text, dino, vae, clip_hidden).
-    clip_hidden is (257, 768) if available, else zeros → signals fallback to CLS.
+    clip_hidden is (257, 1024) if available, else zeros → signals fallback to CLS.
     """
     def __init__(self, betas, clip_i, clip_t, dino, vae, clip_hidden=None):
         self.betas      = torch.tensor(betas,   dtype=torch.float32)
@@ -92,7 +99,7 @@ class AveragedNSDDataset(Dataset):
         self.clip_t     = torch.tensor(clip_t,  dtype=torch.float32)
         self.dino       = torch.tensor(dino,    dtype=torch.float32)
         self.vae        = torch.tensor(vae,     dtype=torch.float32)
-        # clip_hidden: (N, 257, 768) or None → store zeros as sentinel
+        # clip_hidden: (N, 257, 1024) or None → store zeros as sentinel
         if clip_hidden is not None:
             self.clip_hidden = torch.tensor(clip_hidden, dtype=torch.float32)
             self.has_hidden  = True
@@ -164,15 +171,34 @@ class LatentQueryDecoder(nn.Module):
 class ContrastiveProjector(nn.Module):
     """
     Separate MLP projector for retrieval. NEVER shares gradients with regression heads.
-    Input:  pooled visual token  (B, d_model)
-    Output: L2-normalized vector (B, D_PROJ)
+    Input:  pooled visual token  (B, d_model=256) — from BrainMLP, NOT from CLIP
+    Output: L2-normalized vector (B, D_PROJ=1024) — matched to hidden target dim
 
-    If using 257-token hidden target, we project to (B, N_TOKENS * D_HIDDEN_TOKEN)
-    then reshape — but that's huge. Instead we pool the hidden target to (B, 768)
-    and project to that. This is a practical compromise; swap to full 257-token
-    target if you cache the full hidden layer and have memory.
+    The CLIP 257-token hidden layer is the *target* for the loss, not the input.
+    Input to this projector is always your brain encoder's d_model (256).
     """
     def __init__(self, d_model=256, d_out=D_PROJ, dropout=0.1):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(d_model, d_model * 4), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(d_model * 4, d_out),
+        )
+
+    def forward(self, pooled):
+        return F.normalize(self.net(pooled), dim=-1)
+
+
+class TextContrastiveProjector(nn.Module):
+    """
+    Separate projector for text-contrastive retrieval.
+    Input:  pooled visual token (B, d_model=256)
+    Output: L2-normalized (B, 768) — matches COCO caption CLIP text embedding dim.
+
+    Trained with SoftCLIP loss against text embeddings from targets_avg_{subj}.npz.
+    Completely separate from ContrastiveProjector — no shared weights.
+    Masked during training for images without captions (zero text embedding rows).
+    """
+    def __init__(self, d_model=256, d_out=768, dropout=0.1):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(d_model, d_model * 4), nn.GELU(), nn.Dropout(dropout),
@@ -204,8 +230,10 @@ class MindBridgeContrastive(nn.Module):
         self.vae_head        = nn.Linear(d_model * M, vae_shape[0] * vae_shape[1] * vae_shape[2])
         self.vae_shape = vae_shape
         self.M = M
-        # contrastive projector — SEPARATE params, not shared with regression
-        self.projector = ContrastiveProjector(d_model, D_PROJ, dropout=0.1)
+        # image contrastive projector — separate from everything else
+        self.projector      = ContrastiveProjector(d_model, D_PROJ, dropout=0.1)
+        # text contrastive projector — separate from image projector and regression
+        self.text_projector = TextContrastiveProjector(d_model, d_out=768, dropout=0.1)
 
     def forward(self, x):
         brain_tokens  = self.encoder(x)
@@ -217,9 +245,10 @@ class MindBridgeContrastive(nn.Module):
         pred_ct   = self.clip_text_head(pooled)
         pred_dino = self.dino_head(pooled)
         pred_vae  = self.vae_head(flat).view(-1, *self.vae_shape)
-        # contrastive projector output (L2-normalized)
-        proj = self.projector(pooled)
-        return pred_ci, pred_ct, pred_dino, pred_vae, proj
+        # contrastive projector outputs (both L2-normalized)
+        proj      = self.projector(pooled)       # (B, 1024) image contrastive
+        text_proj = self.text_projector(pooled)  # (B, 768)  text contrastive
+        return pred_ci, pred_ct, pred_dino, pred_vae, proj, text_proj
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -295,6 +324,24 @@ def softclip_loss(proj, clip_tgt, temperature=TEMPERATURE):
     return (loss_i + loss_t) / 2
 
 
+def text_contrastive_loss(text_proj, clip_text_tgt, temperature=TEMPERATURE):
+    """
+    SoftCLIP loss for the text projector head.
+    text_proj:     (B, 768) L2-normalized text projector outputs
+    clip_text_tgt: (B, 768) L2-normalized COCO caption CLIP text embeddings
+
+    Only called on samples where the text embedding is valid (non-zero).
+    Returns scalar loss, or zero if no valid samples in batch.
+    """
+    # mask out zero/missing caption rows
+    valid = clip_text_tgt.norm(dim=-1) > 0.01
+    if valid.sum() < 2:
+        return torch.zeros((), device=text_proj.device, dtype=text_proj.dtype)
+
+    tp  = text_proj[valid]
+    tgt = F.normalize(clip_text_tgt[valid], dim=-1)
+    return softclip_loss(tp, tgt, temperature=temperature)
+
 def contrastive_loss(proj, clip_tgt_pooled, epoch, total_epochs,
                      betas_for_mixco=None):
     """
@@ -314,15 +361,24 @@ def contrastive_loss(proj, clip_tgt_pooled, epoch, total_epochs,
 
 def prepare_contrastive_target(clip_hidden, clip_cls, has_hidden):
     """
-    If 257-token hidden layer is available: mean-pool across tokens → (B, 768), L2-norm.
-    Else fall back to CLS vector.
-    Either way returns (B, 768) L2-normalized tensor.
+    If 257-token hidden layer is available: mean-pool across tokens → (B, 1024), L2-norm.
+    Else fall back to CLS vector → (B, 768), L2-norm.
+
+    Note: proj output is D_PROJ=1024 when using hidden path, 1024 for CLS path too
+    (ContrastiveProjector always outputs D_PROJ). Dims must match for dot product in loss.
+    We keep D_PROJ=1024 throughout so hidden and fallback both work.
     """
-    if has_hidden and clip_hidden.norm(dim=-1).mean() > 0.01:
-        pooled = clip_hidden.mean(dim=1)   # (B, N_TOKENS, 768) → (B, 768)
-        return F.normalize(pooled, dim=-1)
-    else:
-        return F.normalize(clip_cls, dim=-1)
+    if has_hidden:
+        # clip_hidden: (B, 257, 1024) — check not zero sentinel via first token
+        if clip_hidden[:, 0, :].norm(dim=-1).mean() > 0.01:
+            pooled = clip_hidden.mean(dim=1)   # (B, 257, 1024) → (B, 1024)
+            return F.normalize(pooled, dim=-1)
+    # CLS fallback: (B, 768) — project to 1024 via a learned linear would be ideal,
+    # but for the fallback case we just pad with zeros to match D_PROJ dim.
+    # In practice you should always have the hidden cache after running ingest_clip_hidden.py.
+    cls_norm = F.normalize(clip_cls, dim=-1)   # (B, 768)
+    pad = torch.zeros(cls_norm.size(0), D_PROJ - cls_norm.size(1), device=cls_norm.device)
+    return torch.cat([cls_norm, pad], dim=-1)  # (B, 1024) zero-padded
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -330,20 +386,38 @@ def prepare_contrastive_target(clip_hidden, clip_cls, has_hidden):
 # ─────────────────────────────────────────────────────────────────────────────
 
 @torch.no_grad()
+def retrieval_2way_on_text_projector(model, val_loader, device):
+    """2-way retrieval measured on the text contrastive projector head."""
+    model.eval()
+    projs, tgts = [], []
+    for b, ci, ct, d, v, ch in val_loader:
+        b  = b.to(device)
+        ct = ct.to(device)
+        _, _, _, _, _, text_proj = model(b)
+        valid = ct.norm(dim=-1) > 0.01
+        if valid.any():
+            projs.append(text_proj[valid].cpu())
+            tgts.append(F.normalize(ct[valid], dim=-1).cpu())
+    if not projs:
+        return float("nan")
+    return retrieval_2way(torch.cat(projs), torch.cat(tgts))
+
+
+@torch.no_grad()
 def retrieval_2way_on_projector(model, val_loader, device, has_hidden):
-    """2-way retrieval measured on the contrastive projector head (not regression head)."""
+    """2-way retrieval measured on the image contrastive projector head."""
     model.eval()
     projs, tgts = [], []
     for b, ci, ct, d, v, ch in val_loader:
         b  = b.to(device)
         ci = ci.to(device)
         ch = ch.to(device)
-        _, _, _, _, proj = model(b)
+        _, _, _, _, proj, _ = model(b)
         tgt = prepare_contrastive_target(ch, ci, has_hidden)
         projs.append(proj.cpu())
         tgts.append(tgt.cpu())
-    projs = torch.cat(projs)  # (N, D)
-    tgts  = torch.cat(tgts)   # (N, D)
+    projs = torch.cat(projs)
+    tgts  = torch.cat(tgts)
     return retrieval_2way(projs, tgts)
 
 
@@ -376,7 +450,7 @@ def load_averaged_subject(root: Path, subj: str):
     # 257-token CLIP hidden layer — optional, falls back to CLS if absent
     hidden_path = avg_dir / f"targets_clip_hidden_{subj}.npy"
     if hidden_path.exists():
-        clip_hidden = np.load(hidden_path)   # expected (N, 257, 768)
+        clip_hidden = np.load(hidden_path)   # expected (N, 257, 1024)
         print(f"  [hidden] Loaded 257-token CLIP hidden layer: {clip_hidden.shape}")
         has_hidden = True
     else:
@@ -439,9 +513,10 @@ def run_training(subj: str = "subj01", root: str | Path = "/mnt/mindbridge", epo
     )
 
     model = MindBridgeContrastive(n_voxels=n_voxels).to(device)
-    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    n_proj   = sum(p.numel() for p in model.projector.parameters() if p.requires_grad)
-    print(f"  Total params: {n_params:,}  (projector: {n_proj:,})")
+    n_params   = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    n_proj     = sum(p.numel() for p in model.projector.parameters() if p.requires_grad)
+    n_txt_proj = sum(p.numel() for p in model.text_projector.parameters() if p.requires_grad)
+    print(f"  Total params: {n_params:,}  (img projector: {n_proj:,}  txt projector: {n_txt_proj:,})")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-2)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
@@ -452,10 +527,10 @@ def run_training(subj: str = "subj01", root: str | Path = "/mnt/mindbridge", epo
     patience_ctr  = 0
 
     print(
-        f"\n{'Ep':>5}|{'reg_loss':>9}|{'ctr_loss':>9}|{'cosim':>7}|"
-        f"{'ret_proj':>9}|{'phase':>8}|{'patience':>8}"
+        f"\n{'Ep':>5}|{'reg_loss':>9}|{'img_ctr':>8}|{'txt_ctr':>8}|{'cosim':>7}|"
+        f"{'ret_img':>8}|{'ret_txt':>8}|{'phase':>8}|{'pat':>5}"
     )
-    print("-" * 72)
+    print("-" * 88)
 
     last_epoch = 0
     for epoch in range(1, epochs + 1):
@@ -465,6 +540,7 @@ def run_training(subj: str = "subj01", root: str | Path = "/mnt/mindbridge", epo
 
         total_reg  = 0.0
         total_ctr  = 0.0
+        total_tctr = 0.0
         n_batches  = 0
 
         optimizer.zero_grad()
@@ -476,58 +552,62 @@ def run_training(subj: str = "subj01", root: str | Path = "/mnt/mindbridge", epo
             v  = v.to(device,  non_blocking=True)
             ch = ch.to(device, non_blocking=True)
 
-            pred_ci, pred_ct, pred_dino, pred_vae, proj = model(b)
+            pred_ci, pred_ct, pred_dino, pred_vae, proj, text_proj = model(b)
 
             # ── regression loss ───────────────────────────────────────────────
             reg_loss, _, _, _, _ = regression_loss(
                 pred_ci, pred_ct, pred_dino, pred_vae, ci, ct, d, v
             )
 
-            # ── contrastive loss on SEPARATE projector head ───────────────────
-            ctr_tgt = prepare_contrastive_target(ch, ci, has_hidden)
-            ctr_loss = contrastive_loss(
-                proj, ctr_tgt, epoch, epochs, betas_for_mixco=b
-            )
+            # ── image contrastive loss (primary retrieval) ────────────────────
+            ctr_tgt  = prepare_contrastive_target(ch, ci, has_hidden)
+            ctr_loss = contrastive_loss(proj, ctr_tgt, epoch, epochs, betas_for_mixco=b)
 
-            loss = (reg_loss + W_CONTRASTIVE * ctr_loss) / ACCUM_STEPS
+            # ── text contrastive loss (semantic/concept signal) ───────────────
+            txt_ctr_loss = text_contrastive_loss(text_proj, ct)
+
+            loss = (
+                reg_loss
+                + W_CONTRASTIVE      * ctr_loss
+                + W_TEXT_CONTRASTIVE * txt_ctr_loss
+            ) / ACCUM_STEPS
             loss.backward()
 
-            total_reg += reg_loss.item()
-            total_ctr += ctr_loss.item()
-            n_batches += 1
+            total_reg  += reg_loss.item()
+            total_ctr  += ctr_loss.item()
+            total_tctr += txt_ctr_loss.item()
+            n_batches  += 1
 
-            # gradient accumulation step
             if (step + 1) % ACCUM_STEPS == 0 or (step + 1) == len(train_loader):
                 nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
                 optimizer.zero_grad()
 
-        avg_reg = total_reg / n_batches
-        avg_ctr = total_ctr / n_batches
+        avg_reg  = total_reg  / n_batches
+        avg_ctr  = total_ctr  / n_batches
+        avg_tctr = total_tctr / n_batches
 
         # ── validation ────────────────────────────────────────────────────────
         model.eval()
         predict_clip_image = lambda m, b_: m(b_)[0]
-        val_cosim = compute_val_clip_cossim(model, val_loader, device, predict_clip_image)
-        val_ret   = retrieval_2way_on_projector(model, val_loader, device, has_hidden)
+        val_cosim   = compute_val_clip_cossim(model, val_loader, device, predict_clip_image)
+        val_ret_img = retrieval_2way_on_projector(model, val_loader, device, has_hidden)
+        val_ret_txt = retrieval_2way_on_text_projector(model, val_loader, device)
 
-        # ── checkpoint best by retrieval on projector ─────────────────────────
-        # also track cosim best via existing helper (for comparison)
         payload = _base_payload(
             epoch, model, optimizer, vm, vs, n_voxels, subj, VARIANT, run_id, epochs,
             extra={
                 "data": "averaged_perception",
-                "val_retrieval_projector": val_ret,
+                "val_retrieval_img_projector": val_ret_img,
+                "val_retrieval_txt_projector": val_ret_txt,
                 "contrastive_target": "hidden_pooled" if has_hidden else "cls_fallback",
             },
         )
-        best_val_cosim = maybe_save_best_clip(
-            ckpt_path, val_cosim, best_val_cosim, payload
-        )
+        best_val_cosim = maybe_save_best_clip(ckpt_path, val_cosim, best_val_cosim, payload)
 
-        # separate best-retrieval checkpoint
-        if val_ret > best_val_ret + MIN_DELTA:
-            best_val_ret = val_ret
+        # early stopping driven by image projector retrieval (primary metric)
+        if val_ret_img > best_val_ret + MIN_DELTA:
+            best_val_ret = val_ret_img
             patience_ctr = 0
             torch.save(payload, ckpt_path / "best_retrieval.pt")
         else:
@@ -537,17 +617,15 @@ def run_training(subj: str = "subj01", root: str | Path = "/mnt/mindbridge", epo
 
         if epoch % 5 == 0 or epoch == 1 or epoch == epochs:
             print(
-                f"{epoch:5d}|{avg_reg:9.4f}|{avg_ctr:9.4f}|{val_cosim:7.4f}|"
-                f"{val_ret:9.4f}|{phase:>8}|{patience_ctr:>8}/{PATIENCE}"
+                f"{epoch:5d}|{avg_reg:9.4f}|{avg_ctr:8.4f}|{avg_tctr:8.4f}|{val_cosim:7.4f}|"
+                f"{val_ret_img:8.4f}|{val_ret_txt:8.4f}|{phase:>8}|{patience_ctr:>5}/{PATIENCE}"
             )
 
-        # ── early stopping ────────────────────────────────────────────────────
         if patience_ctr >= PATIENCE:
             print(
-                f"\n  Early stop at epoch {epoch}: val retrieval flat for "
+                f"\n  Early stop at epoch {epoch}: val img retrieval flat for "
                 f"{PATIENCE} epochs (best={best_val_ret:.4f})"
             )
-            # diagnostic: if still near 50%, flag likely bug
             if best_val_ret < 0.55:
                 print(
                     "  !! val retrieval ≈ 50% despite contrastive head — likely causes:\n"
@@ -568,14 +646,14 @@ def run_training(subj: str = "subj01", root: str | Path = "/mnt/mindbridge", epo
 
     # final eval on both heads
     model.eval()
-    final_cosim = compute_val_clip_cossim(
-        model, val_loader, device, lambda m, b_: m(b_)[0]
-    )
-    final_ret = retrieval_2way_on_projector(model, val_loader, device, has_hidden)
+    final_cosim   = compute_val_clip_cossim(model, val_loader, device, lambda m, b_: m(b_)[0])
+    final_ret_img = retrieval_2way_on_projector(model, val_loader, device, has_hidden)
+    final_ret_txt = retrieval_2way_on_text_projector(model, val_loader, device)
 
-    print(f"\n[4H+CTR] {subj} final results:")
-    print(f"  Regression head  — val CLIP cosim:    {final_cosim:.4f}  (best={best_val_cosim:.4f})")
-    print(f"  Projector head   — val 2-way retrieval: {final_ret:.4f}  (best={best_val_ret:.4f})")
+    print(f"\n[4H+CTR2] {subj} final results:")
+    print(f"  Regression head     — val CLIP cosim:       {final_cosim:.4f}  (best={best_val_cosim:.4f})")
+    print(f"  Image projector     — val 2-way retrieval:  {final_ret_img:.4f}  (best={best_val_ret:.4f})")
+    print(f"  Text projector      — val 2-way retrieval:  {final_ret_txt:.4f}")
     print(f"  Checkpoints: {ckpt_path}")
 
     update_run_manifest(
@@ -584,13 +662,15 @@ def run_training(subj: str = "subj01", root: str | Path = "/mnt/mindbridge", epo
         variant=VARIANT,
         subjects={
             subj: {
-                "val_clip_cosim_final":      final_cosim,
-                "val_clip_cosim_best":       best_val_cosim,
-                "val_retrieval_proj_final":  final_ret,
-                "val_retrieval_proj_best":   best_val_ret,
-                "contrastive_target":        "hidden_pooled" if has_hidden else "cls_fallback",
-                "temperature":               TEMPERATURE,
-                "effective_batch":           64 * ACCUM_STEPS,
+                "val_clip_cosim_final":          final_cosim,
+                "val_clip_cosim_best":           best_val_cosim,
+                "val_retrieval_img_proj_final":  final_ret_img,
+                "val_retrieval_img_proj_best":   best_val_ret,
+                "val_retrieval_txt_proj_final":  final_ret_txt,
+                "contrastive_target":            "hidden_pooled" if has_hidden else "cls_fallback",
+                "temperature":                   TEMPERATURE,
+                "effective_batch":               64 * ACCUM_STEPS,
+                "w_text_contrastive":            W_TEXT_CONTRASTIVE,
             }
         },
     )
@@ -603,21 +683,23 @@ def run_training(subj: str = "subj01", root: str | Path = "/mnt/mindbridge", epo
 if __name__ == "__main__":
     import argparse
 
-    p = argparse.ArgumentParser(description="MindBridge 4H + contrastive retrieval head")
-    p.add_argument("--subj",        default=os.environ.get("NSD_SUBJ",        "subj01"))
-    p.add_argument("--root",        default=os.environ.get("MINDBRIDGE_ROOT", "/mnt/mindbridge"))
-    p.add_argument("--epochs",      type=int,   default=150)
-    p.add_argument("--temperature", type=float, default=TEMPERATURE,
+    p = argparse.ArgumentParser(description="MindBridge 4H + image contrastive + text contrastive heads")
+    p.add_argument("--subj",               default=os.environ.get("NSD_SUBJ",        "subj01"))
+    p.add_argument("--root",               default=os.environ.get("MINDBRIDGE_ROOT", "/mnt/mindbridge"))
+    p.add_argument("--epochs",             type=int,   default=150)
+    p.add_argument("--temperature",        type=float, default=TEMPERATURE,
                    help="InfoNCE/SoftCLIP temperature — sweep 0.01,0.03,0.05,0.07")
-    p.add_argument("--accum-steps", type=int,   default=ACCUM_STEPS,
+    p.add_argument("--accum-steps",        type=int,   default=ACCUM_STEPS,
                    help="gradient accumulation steps (effective_batch = 64 * accum_steps)")
-    p.add_argument("--w-contrastive", type=float, default=W_CONTRASTIVE,
-                   help="weight of contrastive loss relative to regression loss")
+    p.add_argument("--w-contrastive",      type=float, default=W_CONTRASTIVE,
+                   help="weight of image contrastive loss")
+    p.add_argument("--w-text-contrastive", type=float, default=W_TEXT_CONTRASTIVE,
+                   help="weight of text contrastive loss (0 to disable)")
     args = p.parse_args()
 
-    # allow CLI overrides to propagate into module-level constants used by loss fns
-    TEMPERATURE    = args.temperature
-    ACCUM_STEPS    = args.accum_steps
-    W_CONTRASTIVE  = args.w_contrastive
+    TEMPERATURE         = args.temperature
+    ACCUM_STEPS         = args.accum_steps
+    W_CONTRASTIVE       = args.w_contrastive
+    W_TEXT_CONTRASTIVE  = args.w_text_contrastive
 
     run_training(subj=args.subj, root=args.root, epochs=args.epochs)

@@ -1550,6 +1550,51 @@ def compute_retrieval_all():
     }
     return summary
 
+@app.function(
+    image=image,
+    timeout=60 * 5,
+    volumes={MINDBRIDGE_ROOT: volume},
+)
+def inspect_ckpt(path: str):
+    import torch
+
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+
+    print("\n=== FILE ===")
+    print(path)
+
+    print("\n=== TOP LEVEL KEYS ===")
+    print(list(ckpt.keys()))
+
+    sd = ckpt.get("model_state", ckpt)
+
+    print("\n=== FIRST 30 STATE_DICT KEYS ===")
+    for k in list(sd.keys())[:30]:
+        print(k)
+    
+    print("VARIANT:", ckpt.get("variant"))
+    print("EPOCH:", ckpt.get("epoch"))
+    print("CONTRASTIVE TARGET:", ckpt.get("contrastive_target"))
+
+    return "done"
+
+@app.function(image=image, gpu=gpu_fn, timeout=60 * 60 * 2, volumes={MINDBRIDGE_ROOT: volume})
+def eval_whitening(subj: str, run_id: str, variant: str = "4H_CTR2"):
+    _configure_env(subj)
+
+    import sys
+    sys.argv = [
+        "eval_clip_whitening.py",
+        "--subj", subj,
+        "--run-id", run_id,
+        "--variant", variant,
+        "--root", MINDBRIDGE_ROOT,
+    ]
+
+    import runpy
+    runpy.run_path(f"{SCRIPTS_DIR}/eval_clip_whitening.py", run_name="__main__")
+
+    return "whitening complete"
 
 @app.local_entrypoint()
 def main(
@@ -2944,11 +2989,14 @@ def main(
                 args_list.append((subj, "train_retrieval_frozen.py", epochs, f"{rid_base}_{tag}", extra))
         print(f"=== retrieval sweep {len(args_list)} jobs ===")
         print(list(train.starmap(args_list)))
+    # elif step == "eval-whitening":
+    #     extra = ["--split", "both", "--variant", "A"]
+    #     if os.environ.get("WHITEN_VARIANT"):
+    #         extra = ["--split", os.environ.get("WHITEN_SPLIT", "both"), "--variant", os.environ["WHITEN_VARIANT"]]
+    #     print(train.remote(subj, "eval_clip_whitening.py", 1, run_id, extra))
     elif step == "eval-whitening":
-        extra = ["--split", "both", "--variant", "A"]
-        if os.environ.get("WHITEN_VARIANT"):
-            extra = ["--split", os.environ.get("WHITEN_SPLIT", "both"), "--variant", os.environ["WHITEN_VARIANT"]]
-        print(train.remote(subj, "eval_clip_whitening.py", 1, run_id, extra))
+        os.environ["MINDBRIDGE_RUN_ID"] = run_id
+        print(eval_whitening.remote(subj, run_id, variant))
     elif step == "download-roi":
         print(download_roi_all.remote())
     elif step == "download-imagery-meta":
